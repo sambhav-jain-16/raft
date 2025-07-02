@@ -146,7 +146,7 @@ impl Network {
         }
     }
 
-    pub async fn handle_new_connection(&mut self, socket: TcpStream, addr: SocketAddr) -> Result<(), String> {
+    pub async fn handle_new_connection(&mut self, socket: TcpStream, _addr: SocketAddr) -> Result<(), String> {
         let message_sender = self.message_sender.clone();
 
         tokio::spawn(async move {

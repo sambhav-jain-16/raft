@@ -14,6 +14,7 @@ pub struct RequestVote {
 pub struct RequestVoteResponse {
     pub term: Term,
     pub vote_granted: bool,
+    pub voter_id: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
