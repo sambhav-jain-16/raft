@@ -1,4 +1,4 @@
-use crate::types::{LogIndex, NodeId, Term};
+use crate::{log::LogEntry, types::{LogIndex, NodeId, Term}};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,7 +23,7 @@ pub struct AppendEntries {
     pub leader_id: NodeId,
     pub prev_log_index: LogIndex,
     pub prev_log_term: Term,
-    pub entries: Vec<String>,
+    pub entries: Vec<LogEntry>,
     pub leader_commit: LogIndex,
 }
 

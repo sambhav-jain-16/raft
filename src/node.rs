@@ -4,7 +4,7 @@ use crate::log::Log;
 use crate::state_machine::StateMachine;
 use crate::network::Network;
 use crate::timer::{Timer, TimerType};
-use crate::messages::{AppendEntries, RaftMessage, RequestVote, RequestVoteResponse};
+use crate::messages::{AppendEntries, AppendEntriesResponse, RaftMessage, RequestVote, RequestVoteResponse};
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -242,12 +242,11 @@ impl RaftNode {
                 self.handle_request_vote(rv).await
             }
             RaftMessage::RequestVoteResponse(rvr) => {
-                // self.handle_request_vote_response(rvr).await
-                Ok(())
+                self.handle_request_vote_response(rvr).await
             }
             RaftMessage::AppendEntries(ae) => {
-                // self.handle_append_entries(ae).await
-                Ok(())
+                self.handle_append_entries(ae).await
+                // Ok(())
             }
             RaftMessage::AppendEntriesResponse(aer) => {
                 // self.handle_append_entries_response(aer).await
@@ -304,6 +303,82 @@ impl RaftNode {
     
         self.network.lock().unwrap().send_message(rv.candidate_id, RaftMessage::RequestVoteResponse(response)).await?;
         Ok(())
+    }
+
+    async fn handle_request_vote_response(&mut self, rvr: RequestVoteResponse) -> Result<(), String> {
+        let current_state = self.state.lock().unwrap().clone();
+        if current_state != NodeState::Candidate {
+            return Ok(());
+        }
+
+        let current_term = self.term.lock().unwrap().clone();
+        if rvr.term > current_term {
+            self.become_follower(rvr.term);
+            return Ok(());
+        }
+
+        if rvr.term < current_term {
+            return Ok(());
+        }
+        if rvr.vote_granted {
+            self.votes_received.lock().unwrap().insert(rvr.voter_id);
+        }
+
+        let votes_count = self.votes_received.lock().unwrap().len();
+        let majority = (self.cluster_nodes.len() / 2) + 1;
+        if votes_count >= majority {
+            self.become_leader();
+        }
+
+        Ok(())
+    }
+
+    async fn handle_append_entries(&mut self, ae: AppendEntries) -> Result<(), String> {
+        let current_term = self.term.lock().unwrap().clone();
+
+        // If the term is lower than the current term, ignore the message
+        if ae.term < current_term {
+            return Ok(());
+        }
+
+        // If the term is higher than the current term, become a follower
+        if ae.term > current_term {
+            self.become_follower(ae.term);
+            return Ok(());
+        }
+
+        self.election_timer.lock().unwrap().reset();
+
+        let mut log = self.log.lock().unwrap();
+        let last_log_index = log.last_index();
+        if last_log_index < ae.prev_log_index {
+            return Ok(());
+        }
+
+        if ae.prev_log_index > 0 {
+            let prev_log_term = log.get_term(ae.prev_log_index).unwrap_or(0);
+            if prev_log_term != ae.prev_log_term {
+                self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
+                    term: current_term,
+                    success: false,
+                })).await?;
+                return Ok(());
+            }
+        }
+        for entry in ae.entries {
+            log.append(entry).unwrap();
+        }
+
+        let new_commit_index = std::cmp::min(ae.leader_commit, log.last_index());
+        *self.commit_index.lock().unwrap() = new_commit_index;
+
+        self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
+            term: current_term,
+            success: true,
+        })).await?;
+
+        Ok(())
+
     }
 
 }
