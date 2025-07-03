@@ -170,6 +170,9 @@ impl RaftNode {
         // Initialize leader state
         let last_log_index = self.log.lock().unwrap().last_index();
         for &node in &self.cluster_nodes {
+            if node == self.node_id {   
+                continue;
+            }
             self.next_index.lock().unwrap().insert(node, last_log_index + 1);
             self.match_index.lock().unwrap().insert(node, 0);
         }
@@ -374,22 +377,35 @@ impl RaftNode {
         let mut log = self.log.lock().unwrap();
         let last_log_index = log.last_index();
         if last_log_index < ae.prev_log_index {
+            self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
+                term: current_term,
+                success: false,
+                follower_id: self.node_id,
+            })).await?;
             return Ok(());
         }
 
         if ae.prev_log_index > 0 {
             let prev_log_term = log.get_term(ae.prev_log_index).unwrap_or(0);
             if prev_log_term != ae.prev_log_term {
-                        self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
-            term: current_term,
-            success: false,
-            follower_id: self.node_id,
-        })).await?;
-                return Ok(());
+                self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
+                    term: current_term,
+                    success: false,
+                    follower_id: self.node_id,
+                })).await?;
+                log.truncate(ae.prev_log_index);
             }
         }
         for entry in ae.entries {
-            log.append(entry).unwrap();
+            let result = log.append(entry);
+            if let Err(e) = result {
+                self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
+                    term: current_term,
+                    success: false,
+                    follower_id: self.node_id,
+                })).await?;
+                return Ok(());
+            }
         }
 
         let new_commit_index = std::cmp::min(ae.leader_commit, log.last_index());
