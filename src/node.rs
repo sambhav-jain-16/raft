@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::{NodeId, Term, LogIndex, NodeState};
 use crate::log::{Log, LogEntry};
-use crate::state_machine::StateMachine;
 use crate::network::Network;
 use crate::timer::{Timer, TimerType};
 use crate::messages::{AppendEntries, AppendEntriesResponse, RaftMessage, RequestVote, RequestVoteResponse, ClientCommand, ClientResponse};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use crate::app::AppEvent;
 
 // Events for the Raft event loop
 pub enum RaftEvent {
@@ -32,7 +32,6 @@ pub struct RaftNode {
 
     // Components
     log: Arc<Mutex<Log>>,
-    state_machine: Arc<Mutex<Box<dyn StateMachine<Error = String> + Send>>>,
     network: Arc<Mutex<Network>>,
     election_timer: Arc<Mutex<Timer>>,
     heartbeat_timer: Arc<Mutex<Timer>>,
@@ -54,16 +53,16 @@ pub struct RaftNode {
     pending_requests: Arc<Mutex<HashMap<LogIndex, PendingRequest>>>,
     event_sender: mpsc::Sender<RaftEvent>,
     event_receiver: Arc<Mutex<mpsc::Receiver<RaftEvent>>>,
+    app_event_sender: Arc<Mutex<mpsc::Sender<AppEvent>>>,
 }
 
 impl RaftNode {
     pub fn new(
         node_id: NodeId,
         log: Log,
-        state_machine: Box<dyn StateMachine<Error = String> + Send>,
         network: Network,
         cluster_nodes: Vec<NodeId>,
-    ) -> Self {
+    ) -> (Self, mpsc::Receiver<AppEvent>) {
         let election_timer = Timer::new_election_timer();
         let heartbeat_timer = Timer::new_heartbeat_timer();
 
@@ -76,14 +75,14 @@ impl RaftNode {
         }
 
         let (event_sender, event_receiver) = mpsc::channel(100);
+        let (app_event_sender, app_event_receiver) = mpsc::channel(100);
 
-        let mut node = Self {
+        let node = Self {
             node_id,
             term: Arc::new(Mutex::new(0)),
             state: Arc::new(Mutex::new(NodeState::Follower)),
             voted_for: Arc::new(Mutex::new(None)),
             log: Arc::new(Mutex::new(log)),
-            state_machine: Arc::new(Mutex::new(state_machine)),
             network: Arc::new(Mutex::new(network)),
             election_timer: Arc::new(Mutex::new(election_timer)),
             heartbeat_timer: Arc::new(Mutex::new(heartbeat_timer)),
@@ -97,9 +96,10 @@ impl RaftNode {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             event_sender,
             event_receiver: Arc::new(Mutex::new(event_receiver)),
+            app_event_sender:Arc::new(Mutex::new(app_event_sender)),
         };
         node.election_timer.lock().unwrap().start();
-        node
+        (node, app_event_receiver)
     }
 
     pub fn event_sender(&self) -> mpsc::Sender<RaftEvent> {
@@ -135,16 +135,19 @@ impl RaftNode {
         }
     }
 
-    fn become_follower(&mut self, new_term: Term) {
+    async fn become_follower(&mut self, new_term: Term) {
         if new_term > *self.term.lock().unwrap() {
             *self.term.lock().unwrap() = new_term;
             *self.voted_for.lock().unwrap() = None;
-        }
+        }   
         *self.state.lock().unwrap() = NodeState::Follower;
         self.election_timer.lock().unwrap().reset();
         self.votes_received.lock().unwrap().clear();
         *self.current_leader.lock().unwrap() = None;
         self.heartbeat_timer.lock().unwrap().stop();
+
+        let app_event_sender = self.app_event_sender.lock().unwrap();
+        let _ = app_event_sender.send(AppEvent::TermChanged(new_term)).await;
     }
 
     fn become_candidate(&mut self) {
@@ -160,7 +163,7 @@ impl RaftNode {
         self.heartbeat_timer.lock().unwrap().stop();
     }
 
-    fn become_leader(&mut self) {
+    async fn become_leader(&mut self) {
         *self.state.lock().unwrap() = NodeState::Leader;
         *self.current_leader.lock().unwrap() = Some(self.node_id);
         
@@ -174,6 +177,9 @@ impl RaftNode {
         // Start heartbeat timer
         self.heartbeat_timer.lock().unwrap().start();
         self.election_timer.lock().unwrap().stop();
+
+        let app_event_sender = self.app_event_sender.lock().unwrap();
+        let _ = app_event_sender.send(AppEvent::LeaderChanged(Some(self.node_id))).await;
     }
 
     async fn handle_timer_expired(&mut self, timer_type: TimerType) -> Result<(), String> {
@@ -266,7 +272,7 @@ impl RaftNode {
                 self.handle_client_command(cmd.command).await
                 // Ok(())
             }
-            RaftMessage::ClientResponse(cr) => {
+            RaftMessage::ClientResponse(_cr) => {
                 // self.handle_client_response(cr).await
                 Ok(())
             }
@@ -288,7 +294,7 @@ impl RaftNode {
         if rv.term >= current_term {
             new_term = rv.term;
             new_voted_for = None;
-            self.become_follower(rv.term);
+            self.become_follower(rv.term).await;
         }
     
         if new_voted_for.is_none() || new_voted_for == Some(rv.candidate_id) {
@@ -326,7 +332,7 @@ impl RaftNode {
 
         let current_term = self.term.lock().unwrap().clone();
         if rvr.term > current_term {
-            self.become_follower(rvr.term);
+            self.become_follower(rvr.term).await;
             return Ok(());
         }
 
@@ -340,7 +346,7 @@ impl RaftNode {
         let votes_count = self.votes_received.lock().unwrap().len();
         let majority = (self.cluster_nodes.len() / 2) + 1;
         if votes_count >= majority {
-            self.become_leader();
+            self.become_leader().await;
         }
 
         Ok(())
@@ -356,8 +362,10 @@ impl RaftNode {
 
         // If the term is higher than the current term, become a follower
         if ae.term > current_term {
-            self.become_follower(ae.term);
+            self.become_follower(ae.term).await;
             *self.current_leader.lock().unwrap() = Some(ae.leader_id);
+            let app_event_sender = self.app_event_sender.lock().unwrap();
+            let _ = app_event_sender.send(AppEvent::LeaderChanged(Some(ae.leader_id))).await;
             return Ok(());
         }
 
@@ -405,7 +413,7 @@ impl RaftNode {
 
         let current_term = *self.term.lock().unwrap();
         if aer.term > current_term {
-            self.become_follower(aer.term);
+            self.become_follower(aer.term).await;
             return Ok(());
         }
 
@@ -596,8 +604,8 @@ impl RaftNode {
                 log.get(i).cloned().ok_or(format!("Log entry not found at index {}", i))?
             };
 
-            let mut state_machine = self.state_machine.lock().unwrap();
-            state_machine.apply(&entry.command)?;
+            let app_event_sender = self.app_event_sender.lock().unwrap();
+            let _ = app_event_sender.send(AppEvent::EntryCommitted(entry)).await;
         }
 
         *last_applied = commit_index;
