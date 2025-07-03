@@ -42,10 +42,19 @@ pub struct ClientCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientResponse {
+    pub request_id: Uuid,
+    pub success: bool,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftMessage {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
     ClientCommand(ClientCommand),
+    ClientResponse(ClientResponse),
 }

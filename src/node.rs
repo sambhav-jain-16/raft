@@ -4,7 +4,7 @@ use crate::log::{Log, LogEntry};
 use crate::state_machine::StateMachine;
 use crate::network::Network;
 use crate::timer::{Timer, TimerType};
-use crate::messages::{AppendEntries, AppendEntriesResponse, RaftMessage, RequestVote, RequestVoteResponse, ClientCommand};
+use crate::messages::{AppendEntries, AppendEntriesResponse, RaftMessage, RequestVote, RequestVoteResponse, ClientCommand, ClientResponse};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -14,6 +14,13 @@ pub enum RaftEvent {
     TimerExpired(TimerType),
     Message(RaftMessage),
     ClientCommand(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    request_id: Uuid,
+    client_id: NodeId,
+    command: String,
 }
 
 pub struct RaftNode {
@@ -44,6 +51,7 @@ pub struct RaftNode {
     current_leader: Arc<Mutex<Option<NodeId>>>,       // Known leader
 
     // Channel for event-driven communication
+    pending_requests: Arc<Mutex<HashMap<LogIndex, PendingRequest>>>,
     event_sender: mpsc::Sender<RaftEvent>,
     event_receiver: Arc<Mutex<mpsc::Receiver<RaftEvent>>>,
 }
@@ -86,6 +94,7 @@ impl RaftNode {
             cluster_nodes,
             votes_received: Arc::new(Mutex::new(HashSet::new())),
             current_leader: Arc::new(Mutex::new(None)),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
             event_sender,
             event_receiver: Arc::new(Mutex::new(event_receiver)),
         };
@@ -257,6 +266,10 @@ impl RaftNode {
                 self.handle_client_command(cmd.command).await
                 // Ok(())
             }
+            RaftMessage::ClientResponse(cr) => {
+                // self.handle_client_response(cr).await
+                Ok(())
+            }
         }
     }
 
@@ -427,24 +440,35 @@ impl RaftNode {
     }
 
     async fn try_commit_entries(&mut self) -> Result<(), String> {
-        let log = self.log.lock().unwrap();
         let match_indices:Vec<LogIndex> = self.match_index.lock().unwrap().values().cloned().collect();
-
         let mut sorted_indices = match_indices.clone();
         sorted_indices.sort();
-
         let majority_index = sorted_indices[sorted_indices.len() / 2];
 
         if majority_index > 0 {
-            let term_at_majority = log.get_term(majority_index).unwrap_or(0);
-        let current_term = *self.term.lock().unwrap();
-        
-        if term_at_majority == current_term {
-            let mut commit_index = self.commit_index.lock().unwrap();
-            if majority_index > *commit_index {
-                *commit_index = majority_index;
+            let majority_established = {
+                let term_at_majority = {
+                    let log = self.log.lock().unwrap();
+                    log.get_term(majority_index).unwrap_or(0)
+                };
+                let current_term = *self.term.lock().unwrap();
+                term_at_majority == current_term
+
+            };
+            
+            if majority_established {
+                let mut commit_index = self.commit_index.lock().unwrap();
+                if majority_index > *commit_index {
+                    let old_commit_index = *commit_index;
+                    *commit_index = majority_index;
+
+                    drop(commit_index);
+
+                    for i in (old_commit_index +1)..=majority_index {
+                        self.send_client_response(i, true, Some("Command committed".to_string()), None).await?;
+                    }
+                }
             }
-        }
         }
 
         Ok(())
@@ -478,6 +502,13 @@ impl RaftNode {
 
         self.log.lock().unwrap().append(entry).map_err(|e| format!("Failed to append log entry: {}", e))?;
 
+        let request_id = Uuid::new_v4();
+        let pending_request = PendingRequest {
+            request_id,
+            client_id: self.node_id,
+            command: cmd,
+        };
+        self.pending_requests.lock().unwrap().insert(log_index, pending_request);
         self.replicate_log_entry(log_index).await?;
 
         Ok(())
@@ -514,11 +545,12 @@ impl RaftNode {
 
         match current_leader {
             Some(leader_id) => {
+                let request_id = Uuid::new_v4();
                 self.network.lock().unwrap().send_message(
                     leader_id, RaftMessage::ClientCommand(ClientCommand{
                         command: cmd,
                         client_id: self.node_id,
-                        request_id: Uuid::new_v4(),
+                        request_id,
                 })).await?;
             }
             None => {
@@ -531,6 +563,24 @@ impl RaftNode {
 
     async fn reject_client_command(&mut self, cmd: String) -> Result<(), String> {
         println!("Rejecting client command: {}", cmd);
+        Ok(())
+    }
+
+    async fn send_client_response(&mut self, log_index: LogIndex, success: bool, result: Option<String>, error: Option<String>) -> Result<(), String> {
+        if let Some(pending_request) = self.pending_requests.lock().unwrap().remove(&log_index) {
+            let response = ClientResponse {
+                request_id: pending_request.request_id,
+                success,
+                result,
+                error,
+            };
+
+            self.network.lock().unwrap().send_message(
+                pending_request.client_id, 
+                RaftMessage::ClientResponse(response)
+            ).await?;
+        }
+
         Ok(())
     }
 
