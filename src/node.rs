@@ -357,6 +357,7 @@ impl RaftNode {
         // If the term is higher than the current term, become a follower
         if ae.term > current_term {
             self.become_follower(ae.term);
+            *self.current_leader.lock().unwrap() = Some(ae.leader_id);
             return Ok(());
         }
 
@@ -471,6 +472,7 @@ impl RaftNode {
             }
         }
 
+        self.apply_committed_entries().await?;
         Ok(())
     }
 
@@ -584,4 +586,21 @@ impl RaftNode {
         Ok(())
     }
 
+    async fn apply_committed_entries(&mut self) -> Result<(), String> {
+        let mut last_applied = self.last_applied.lock().unwrap();
+        let commit_index = *self.commit_index.lock().unwrap();
+
+        for i in (*last_applied + 1)..=commit_index {
+            let entry = {
+                let log = self.log.lock().unwrap();
+                log.get(i).cloned().ok_or(format!("Log entry not found at index {}", i))?
+            };
+
+            let mut state_machine = self.state_machine.lock().unwrap();
+            state_machine.apply(&entry.command)?;
+        }
+
+        *last_applied = commit_index;
+        Ok(())
+    }
 }
