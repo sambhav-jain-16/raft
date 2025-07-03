@@ -31,6 +31,7 @@ pub struct AppendEntries {
 pub struct AppendEntriesResponse {
     pub term: Term,
     pub success: bool,
+    pub follower_id: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

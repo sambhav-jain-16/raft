@@ -249,8 +249,8 @@ impl RaftNode {
                 // Ok(())
             }
             RaftMessage::AppendEntriesResponse(aer) => {
-                // self.handle_append_entries_response(aer).await
-                Ok(())
+                self.handle_append_entries_response(aer).await
+                // Ok(())
             }
             RaftMessage::ClientCommand(cmd) => {
                 // You can call handle_client_command here if you want
@@ -358,10 +358,11 @@ impl RaftNode {
         if ae.prev_log_index > 0 {
             let prev_log_term = log.get_term(ae.prev_log_index).unwrap_or(0);
             if prev_log_term != ae.prev_log_term {
-                self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
-                    term: current_term,
-                    success: false,
-                })).await?;
+                        self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
+            term: current_term,
+            success: false,
+            follower_id: self.node_id,
+        })).await?;
                 return Ok(());
             }
         }
@@ -375,10 +376,78 @@ impl RaftNode {
         self.network.lock().unwrap().send_message(ae.leader_id, RaftMessage::AppendEntriesResponse(AppendEntriesResponse{
             term: current_term,
             success: true,
+            follower_id: self.node_id,
         })).await?;
 
         Ok(())
 
+    }
+
+    async fn handle_append_entries_response(&mut self, aer: AppendEntriesResponse) -> Result<(), String> {
+        let current_state = self.state.lock().unwrap().clone();
+        if current_state != NodeState::Leader {
+            return Ok(());
+        }
+
+        let current_term = *self.term.lock().unwrap();
+        if aer.term > current_term {
+            self.become_follower(aer.term);
+            return Ok(());
+        }
+
+        if aer.term < current_term {
+            return Ok(());
+        }
+
+        let follower_id = aer.follower_id;
+        if aer.success {
+            // Update match_index and next_index for this follower
+            {
+                let mut match_index = self.match_index.lock().unwrap();
+                let mut next_index = self.next_index.lock().unwrap();
+                
+                let current_match = match_index.get(&follower_id).unwrap_or(&0);
+                let new_match = current_match + 1;
+                match_index.insert(follower_id, new_match);
+                next_index.insert(follower_id, new_match + 1);
+            }
+
+            self.try_commit_entries().await?;
+        } else {
+            {
+                let mut next_index = self.next_index.lock().unwrap();
+                let current_next = *next_index.get(&follower_id).unwrap_or(&1);
+                if current_next > 1 {
+                    next_index.insert(follower_id, current_next - 1);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn try_commit_entries(&mut self) -> Result<(), String> {
+        let log = self.log.lock().unwrap();
+        let match_indices:Vec<LogIndex> = self.match_index.lock().unwrap().values().cloned().collect();
+
+        let mut sorted_indices = match_indices.clone();
+        sorted_indices.sort();
+
+        let majority_index = sorted_indices[sorted_indices.len() / 2];
+
+        if majority_index > 0 {
+            let term_at_majority = log.get_term(majority_index).unwrap_or(0);
+        let current_term = *self.term.lock().unwrap();
+        
+        if term_at_majority == current_term {
+            let mut commit_index = self.commit_index.lock().unwrap();
+            if majority_index > *commit_index {
+                *commit_index = majority_index;
+            }
+        }
+        }
+
+        Ok(())
     }
 
 }
