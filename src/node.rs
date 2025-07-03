@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::{NodeId, Term, LogIndex, NodeState};
-use crate::log::Log;
+use crate::log::{Log, LogEntry};
 use crate::state_machine::StateMachine;
 use crate::network::Network;
 use crate::timer::{Timer, TimerType};
-use crate::messages::{AppendEntries, AppendEntriesResponse, RaftMessage, RequestVote, RequestVoteResponse};
-use std::time::Instant;
+use crate::messages::{AppendEntries, AppendEntriesResponse, RaftMessage, RequestVote, RequestVoteResponse, ClientCommand};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 // Events for the Raft event loop
 pub enum RaftEvent {
@@ -119,7 +119,7 @@ impl RaftNode {
                     }
                     RaftEvent::ClientCommand(cmd) => {
                         // Handle client command
-                        return Ok(());
+                        self.handle_client_command(cmd).await?;
                     }
                 }
             }
@@ -254,8 +254,8 @@ impl RaftNode {
             }
             RaftMessage::ClientCommand(cmd) => {
                 // You can call handle_client_command here if you want
-                // self.handle_client_command(cmd.command).await
-                Ok(())
+                self.handle_client_command(cmd.command).await
+                // Ok(())
             }
         }
     }
@@ -447,6 +447,90 @@ impl RaftNode {
         }
         }
 
+        Ok(())
+    }
+
+    async fn handle_client_command(&mut self, cmd: String) -> Result<(), String> {
+        let current_state = self.state.lock().unwrap().clone();
+
+        match current_state {
+            NodeState::Leader => {
+                self.process_client_command_as_leader(cmd).await
+            }
+            NodeState::Follower => {
+                self.redirect_to_leader(cmd).await
+            }
+            NodeState::Candidate => {
+                self.reject_client_command(cmd).await
+            }
+        }
+    }
+
+    async fn process_client_command_as_leader(&mut self, cmd: String) -> Result<(), String> {
+        let current_term = *self.term.lock().unwrap();
+        let log_index = self.log.lock().unwrap().last_index() + 1;
+
+        let entry  = LogEntry {
+            term: current_term,
+            index: log_index,
+            command: cmd.clone(),
+        };
+
+        self.log.lock().unwrap().append(entry).map_err(|e| format!("Failed to append log entry: {}", e))?;
+
+        self.replicate_log_entry(log_index).await?;
+
+        Ok(())
+    }
+
+    async fn replicate_log_entry(&mut self, log_index: LogIndex) -> Result<(), String> {
+        let term = *self.term.lock().unwrap();
+        let commit_index = *self.commit_index.lock().unwrap();
+        let log = self.log.lock().unwrap();
+
+
+        let entry = log.get(log_index).ok_or(format!("Log entry not found at index {}", log_index))?;
+
+        let message = RaftMessage::AppendEntries(AppendEntries {
+            term,
+            leader_id: self.node_id,
+            prev_log_index: log_index - 1,
+            prev_log_term: if log_index > 1 { log.get_term(log_index - 1).unwrap_or(0) } else { 0 },
+            entries: vec![entry.clone()],
+            leader_commit: commit_index,
+        });
+
+        for &node in &self.cluster_nodes {
+            if node != self.node_id {
+                self.network.lock().unwrap().send_message(node, message.clone()).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn redirect_to_leader(&mut self, cmd: String) -> Result<(), String> {
+        let current_leader = *self.current_leader.lock().unwrap();
+
+        match current_leader {
+            Some(leader_id) => {
+                self.network.lock().unwrap().send_message(
+                    leader_id, RaftMessage::ClientCommand(ClientCommand{
+                        command: cmd,
+                        client_id: self.node_id,
+                        request_id: Uuid::new_v4(),
+                })).await?;
+            }
+            None => {
+                return Err(format!("No leader found"));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn reject_client_command(&mut self, cmd: String) -> Result<(), String> {
+        println!("Rejecting client command: {}", cmd);
         Ok(())
     }
 
